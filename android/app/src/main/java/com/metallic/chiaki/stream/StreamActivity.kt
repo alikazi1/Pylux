@@ -58,6 +58,7 @@ class StreamActivity : AppCompatActivity(), View.OnSystemUiVisibilityChangeListe
 		// libchiaki refreshes all overlay metrics once per second (from the periodic
 		// CONNECTIONQUALITY message), so polling faster only re-reads stale values.
 		private const val STATS_POLL_INTERVAL_MS = 1000L
+		private const val CONTROLLER_RUMBLE_PULSE_MS = 250L
 	}
 
 	private lateinit var viewModel: StreamViewModel
@@ -198,28 +199,23 @@ class StreamActivity : AppCompatActivity(), View.OnSystemUiVisibilityChangeListe
 			// User-scalable strength (0..500%). Read once at stream start (restart to change);
 			// avoids reading SharedPreferences on every rumble event (~80/s).
 			val rumbleScale = Preferences(this).rumbleIntensity / 100f
-			var lastVibrator: Vibrator? = null
 			viewModel.session.rumbleState.observe(this, Observer {
-				// Prefer the connected controller's own motor over the phone's
-				// (resolved per event so controller hotplug just works; the device
-				// list is tiny and rumble events are sparse). L/R are averaged into
-				// one amplitude because both targets expose a single channel here.
-				val cv = controllerVibrator()
-				val vibrator = cv ?: phoneVibrator
-				val amplitude = (((it.left.toInt() + it.right.toInt()) / 2) * rumbleScale).toInt().coerceIn(0, 255)
-				// Cancel the PREVIOUS target too: when the target switches
-				// (controller connects/disconnects mid-rumble), cancelling only the
-				// new one would leave the old motor buzzing out its 1s one-shot.
-				if(lastVibrator !== vibrator)
-					lastVibrator?.cancel()
-				lastVibrator = vibrator
-				vibrator.cancel()
+				// Prefer the connected controller's own vibrator(s). On Android 12+
+				// some controllers (including GameSir models) expose rumble as
+				// individual VibratorManager IDs rather than a useful defaultVibrator.
+				// If no controller vibrator is available, retain the original phone
+				// vibration fallback.
+				if(vibrateController(it.left.toInt(), it.right.toInt(), rumbleScale))
+					return@Observer
+
+				val amplitude = ((((it.left.toInt() + it.right.toInt()) / 2f) * rumbleScale).toInt()).coerceIn(0, 255)
+				phoneVibrator.cancel()
 				if(amplitude == 0)
 					return@Observer
 				if(Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-					vibrator.vibrate(VibrationEffect.createOneShot(1000, amplitude))
+					phoneVibrator.vibrate(VibrationEffect.createOneShot(CONTROLLER_RUMBLE_PULSE_MS, amplitude))
 				else
-					vibrator.vibrate(1000)
+					phoneVibrator.vibrate(CONTROLLER_RUMBLE_PULSE_MS)
 			})
 		}
 	}
@@ -551,24 +547,79 @@ class StreamActivity : AppCompatActivity(), View.OnSystemUiVisibilityChangeListe
 	}
 
 	/**
-	 * The connected gamepad's own vibrator, if it has one. VibratorManager on
-	 * API 31+, the legacy InputDevice.vibrator below that. Null when no attached
-	 * gamepad can rumble (caller falls back to the phone vibrator).
+	 * Sends rumble directly to the connected gamepad. Android 12+ controllers can
+	 * expose one or more vibrator IDs through InputDevice.vibratorManager. Using
+	 * those IDs is more reliable than defaultVibrator and also lets us preserve
+	 * separate left/right motor amplitudes when the controller exposes two motors.
+	 *
+	 * @return true when a controller vibrator handled the event; false means the
+	 * caller should fall back to the phone vibrator.
 	 */
-	private fun controllerVibrator(): Vibrator?
-		= InputDevice.getDeviceIds().asSequence()
+	private fun vibrateController(left: Int, right: Int, scale: Float): Boolean
+	{
+		val device = InputDevice.getDeviceIds().asSequence()
 			.mapNotNull { InputDevice.getDevice(it) }
-			.filter {
+			.firstOrNull {
 				it.sources and InputDevice.SOURCE_GAMEPAD == InputDevice.SOURCE_GAMEPAD
 					|| it.sources and InputDevice.SOURCE_CLASS_JOYSTICK == InputDevice.SOURCE_CLASS_JOYSTICK
+			} ?: return false
+
+		val leftAmplitude = (left * scale).toInt().coerceIn(0, 255)
+		val rightAmplitude = (right * scale).toInt().coerceIn(0, 255)
+
+		if(Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
+		{
+			val manager = device.vibratorManager
+			val vibratorIds = manager.vibratorIds
+			if(vibratorIds.isEmpty())
+				return false
+
+			val vibrators = vibratorIds.map { manager.getVibrator(it) }.filter { it.hasVibrator() }
+			if(vibrators.isEmpty())
+				return false
+
+			if(vibrators.size >= 2)
+			{
+				// Most dual-motor Android gamepads report the low-frequency/left motor
+				// first and the high-frequency/right motor second. Preserve both.
+				vibrateMotor(vibrators[0], leftAmplitude)
+				vibrateMotor(vibrators[1], rightAmplitude)
+				// If a controller reports extra vibrator endpoints, feed them the
+				// stronger side so they are not silently ignored.
+				val extraAmplitude = maxOf(leftAmplitude, rightAmplitude)
+				for(i in 2 until vibrators.size)
+					vibrateMotor(vibrators[i], extraAmplitude)
 			}
-			.mapNotNull { dev ->
-				if(Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
-					dev.vibratorManager.defaultVibrator.takeIf { it.hasVibrator() }
-				else
-					@Suppress("DEPRECATION") dev.vibrator.takeIf { it.hasVibrator() }
+			else
+			{
+				val mixed = ((leftAmplitude + rightAmplitude) / 2).coerceIn(0, 255)
+				vibrateMotor(vibrators[0], mixed)
 			}
-			.firstOrNull()
+			return true
+		}
+
+		@Suppress("DEPRECATION")
+		val vibrator = device.vibrator
+		if(!vibrator.hasVibrator())
+			return false
+		val mixed = ((leftAmplitude + rightAmplitude) / 2).coerceIn(0, 255)
+		vibrateMotor(vibrator, mixed)
+		return true
+	}
+
+	private fun vibrateMotor(vibrator: Vibrator, amplitude: Int)
+	{
+		vibrator.cancel()
+		if(amplitude <= 0)
+			return
+		if(Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+			vibrator.vibrate(VibrationEffect.createOneShot(CONTROLLER_RUMBLE_PULSE_MS, amplitude))
+		else
+		{
+			@Suppress("DEPRECATION")
+			vibrator.vibrate(CONTROLLER_RUMBLE_PULSE_MS)
+		}
+	}
 
 	/**
 	 * Physical controller touchpad (DualSense/DS4) support: Android only delivers

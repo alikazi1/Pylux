@@ -20,7 +20,7 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '21'
           cache: gradle
 
       - name: Set up Android SDK
@@ -36,6 +36,12 @@ jobs:
           sdkmanager "build-tools;35.0.0"
           sdkmanager "ndk;28.2.13676358"
           sdkmanager "cmake;3.30.4"
+
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          protoc --version
 
       - name: Make Gradle executable
         run: chmod +x ./android/gradlew
